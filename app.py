@@ -3,16 +3,18 @@ import pandas as pd
 import re
 from io import BytesIO
 import os
-import pdfplumber
+from pdf2image import convert_from_bytes
+import pytesseract
+from PIL import Image
 
 # --- 2. HELPER FUNCTIONS ---
 def clean_value(value):
     """
     Cleans numeric values by handling SA (comma for decimal, space/dot for thousands) format.
-    Kept as a safety net for the extraction output.
+    Kept as a safety net for the AI's JSON output.
     """
     if not isinstance(value, str):
-        # Handle direct float/int from extraction output
+        # Handle direct float/int from AI's JSON output
         if isinstance(value, (int, float)):
             return float(value)
         return None
@@ -31,7 +33,7 @@ def clean_value(value):
     value = value.replace(',', '.')
     
     # 4. Clean up formatting indicators (Dr/Cr)
-    # NOTE: This ensures that if the extraction missed the sign, the 'Dr' prefix/suffix is converted to a minus sign.
+    # NOTE: This ensures that if the AI missed the sign, the 'Dr' prefix/suffix is converted to a minus sign.
     value = value.replace('Cr', '').replace('Dr', '-').strip()
     
     # 5. Final aggressive cleanup to remove non-numeric/non-dot/non-sign characters
@@ -61,95 +63,83 @@ def clean_description_for_xero(description):
     
     return description
 
-# --- 4. CORE EXTRACTION LOGIC (PDFPLUMBER ONLY - WITH PRECISION COLUMN EXCLUSION) ---
+# --- 4. CORE EXTRACTION LOGIC (OCR with pytesseract - FOR IMAGE-BASED PDFs) ---
 def extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.DataFrame, str | None]:
     """
-    PRIMARY METHOD: Uses pdfplumber for extraction based on table detection,
-    focusing on excluding the dedicated Fees (R) column, extracting the StatementYear,
-    and enforcing the sign convention (Credit = Positive, Debit = Negative).
+    Uses OCR (pytesseract) to extract text from image-based PDFs, then parses for year and transactions.
+    Focuses on excluding fees if detected, extracting StatementYear, and enforcing sign convention.
     Returns a DataFrame and the extracted year (as a string, or None on failure).
     """
-    st.info("🔄 **Initiating PDF Extraction...** (Extracting Year and Transactions)")
+    st.info("🔄 **Initiating OCR Extraction...** (Extracting Year and Transactions from Image-based PDF)")
     try:
-        with pdfplumber.open(pdf_file_path) as pdf:
-            full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-            
-            # Extract statement year from text (adjust regex based on common patterns in SA bank statements)
-            year_pattern = r'(?:Statement Period|Statement Date).*?(\d{4})'
-            match = re.search(year_pattern, full_text, re.IGNORECASE)
-            statement_year = match.group(1) if match else None
-            
-            # Extract tables from all pages
-            all_tables = []
-            for page in pdf.pages:
-                tables = page.extract_tables()
-                for table in tables:
-                    if table and len(table) > 1:  # Ensure there's a header and data
-                        # Create DataFrame, stripping whitespace from headers
-                        df_table = pd.DataFrame(table[1:], columns=[col.strip() if col else '' for col in table[0]])
-                        all_tables.append(df_table)
-            
-            if not all_tables:
-                st.error(f"No tables detected in {file_name}. Ensure the PDF contains selectable text/tables.")
-                return pd.DataFrame(), None
-            
-            # Concatenate all tables
-            df = pd.concat(all_tables, ignore_index=True)
-            
-            # Standardize column names (handle variations in bank statement layouts)
-            column_mapping = {
-                'Date': ['Date', 'Trans Date', 'Transaction Date'],
-                'Description': ['Description', 'Details', 'Transaction Details'],
-                'Debits': ['Debits (R)', 'Debits', 'Debit (R)', 'Debit Amount'],
-                'Credits': ['Credits (R)', 'Credits', 'Credit (R)', 'Credit Amount'],
-                'Fees': ['Fees (R)', 'Fees', 'Service Fee'],
-                'Amount': ['Amount', 'Value', 'Transaction Amount'],  # If single amount column
-                'Balance': ['Balance (R)', 'Balance', 'Running Balance']
-            }
-            
-            for standard, possibles in column_mapping.items():
-                for poss in possibles:
-                    if poss in df.columns:
-                        df.rename(columns={poss: standard}, inplace=True)
-                        break
-            
-            # Exclude the Fees column if present
-            if 'Fees' in df.columns:
-                df = df.drop('Fees', axis=1)
-            
-            # Handle Amount: Combine Debits/Credits if separate, or clean single Amount
-            if 'Amount' not in df.columns:
-                df['Amount'] = 0.0
-                if 'Credits' in df.columns:
-                    df['Amount'] += df['Credits'].apply(clean_value).fillna(0)
-                if 'Debits' in df.columns:
-                    df['Amount'] -= df['Debits'].apply(clean_value).fillna(0)
-            else:
-                # If single Amount column, apply cleaning (handles Dr/Cr signs)
-                df['Amount'] = df['Amount'].apply(clean_value)
-            
-            # Drop unnecessary columns
-            drop_cols = [col for col in ['Debits', 'Credits', 'Balance', 'Fees'] if col in df.columns]
-            df = df.drop(columns=drop_cols, errors='ignore')
-            
-            # Filter valid transaction rows (non-empty Date, Description, non-zero Amount)
-            df = df[(df['Date'].notna() & (df['Date'].str.strip() != '')) &
-                    (df['Description'].notna() & (df['Description'].str.strip() != '')) &
-                    (df['Amount'].notna() & (df['Amount'] != 0))]
-            
-            if df.empty:
-                st.error(f"No valid transactions extracted from {file_name} after filtering.")
-                return pd.DataFrame(), None
-            
-            st.success(f"Extraction successful! Year **{statement_year or 'Not Found'}** extracted with {len(df)} transactions.")
-            return df[['Date', 'Description', 'Amount']], statement_year
+        # Convert PDF to images
+        images = convert_from_bytes(pdf_file_path.getvalue())
         
+        full_text = ''
+        for image in images:
+            text = pytesseract.image_to_string(image)
+            full_text += text + '\n\n'
+        
+        if not full_text.strip():
+            st.error(f"No text extracted from {file_name}. Ensure the PDF has readable content.")
+            return pd.DataFrame(), None
+        
+        # Extract statement year
+        year_pattern = r'(?:Statement Period|Statement Date).*?(\d{4})'
+        match = re.search(year_pattern, full_text, re.IGNORECASE)
+        statement_year = match.group(1) if match else None
+        
+        # Parse transactions from text
+        # Assume transaction lines follow a pattern like: Date (dd Mon) Description ... Debit/Credit Amount
+        # We will split lines and parse those matching date pattern
+        lines = full_text.splitlines()
+        transactions = []
+        in_table = False
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Detect table header to start parsing
+            if re.search(r'Date.*Description.*(Debit|Credit|Amount)', line, re.IGNORECASE):
+                in_table = True
+                continue
+            if in_table:
+                # Match lines starting with date like '01 Sep'
+                match = re.match(r'(\d{1,2}\s+[A-Za-z]{3})\s+(.*?)\s+(-?[\d.,]+(?:\s*(Dr|Cr))?)?$', line, re.IGNORECASE)
+                if match:
+                    date = match.group(1)
+                    desc = match.group(2).strip()
+                    amt_str = match.group(3)
+                    if amt_str:
+                        amt = clean_value(amt_str)
+                        # Enforce sign: if 'Dr' or in debit column (assuming), negative; 'Cr' positive
+                        if 'dr' in amt_str.lower():
+                            amt = -abs(amt) if amt > 0 else amt
+                        elif 'cr' in amt_str.lower():
+                            amt = abs(amt) if amt < 0 else amt
+                        transactions.append({'Date': date, 'Description': desc, 'Amount': amt})
+                # If line doesn't match, perhaps end of table
+                elif re.search(r'total|balance|summary', line, re.IGNORECASE):
+                    in_table = False
+        
+        if not transactions:
+            st.error(f"No transactions parsed from {file_name}. Adjust parsing logic if format differs.")
+            return pd.DataFrame(), None
+        
+        df = pd.DataFrame(transactions)
+        
+        # Exclude fees: Filter out rows where description indicates fee (customize as needed)
+        df = df[~df['Description'].str.contains('fee|charge|service', case=False, na=False)]
+        
+        st.success(f"OCR Extraction successful! Year **{statement_year or 'Not Found'}** extracted with {len(df)} transactions.")
+        return df[['Date', 'Description', 'Amount']], statement_year
+    
     except Exception as e:
-        st.error(f"PDF extraction failed for {file_name} due to an unexpected error. Error: {e}")
+        st.error(f"OCR Extraction failed for {file_name} due to an unexpected error. Error: {e}")
         return pd.DataFrame(), None
 
 def parse_pdf_data(pdf_file_path, file_name):
-    """Core function: Uses pdfplumber for extraction, returning DataFrame and Year."""
+    """Core function: Uses OCR for extraction, returning DataFrame and Year."""
     
     pdf_file_path.seek(0)
     
@@ -178,12 +168,14 @@ def parse_pdf_data(pdf_file_path, file_name):
 if 'uploaded_files' not in st.session_state:
     st.session_state['uploaded_files'] = []
 
-st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter (pdfplumber)", layout="wide")
-st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (Free, No API Key)")
+st.set_page_config(page_title="🇿🇦 Free SA Bank Statement to CSV Converter (OCR)", layout="wide")
+st.title("🇿🇦 SA Bank Statement PDF to CSV Converter (Free OCR, No API Key)")
 st.markdown("""
-    ### Using **pdfplumber** (a free, open-source library) to extract the statement year and transactions, filtering out the dedicated Fees (R) column. **Credit/Debit sign is enforced** (Credit=Positive, Debit=Negative).
+    ### Using **pytesseract** (free, open-source OCR) to handle image-based PDFs, extract year and transactions, filtering fees. **Credit/Debit sign enforced**.
     ---
 """)
+
+st.sidebar.success("OCR Engine: **Active** ✅ (Handles scanned/image PDFs - No API Key Required)")
 
 uploaded_files = st.file_uploader(
     "Upload your bank statement PDF files (Multiple files supported)",
@@ -273,7 +265,7 @@ if uploaded_files:
         final_combined_df = pd.concat(all_df, ignore_index=True)
         
         st.markdown("---")
-        st.subheader("✅ All Transactions Combined and Ready for Download (Fees Column Excluded, Year Dynamic)")
+        st.subheader("✅ All Transactions Combined and Ready for Download (Fees Excluded, Year Dynamic)")
         
         st.dataframe(final_combined_df)
         
